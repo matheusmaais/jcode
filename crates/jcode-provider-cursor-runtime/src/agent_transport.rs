@@ -224,6 +224,67 @@ fn encode_model_meta(name: &str, fast: bool) -> Vec<u8> {
     out
 }
 
+/// Resolve a jcode/live-catalog model id (e.g. `cursor-grok-4.6-high-fast`,
+/// `claude-opus-5-thinking-high`, `gpt-5.4-high`) into the bare base id the
+/// Cursor agent backend actually accepts (e.g. `grok-4.6`, `claude-opus-5`,
+/// `gpt-5.4`), plus the `fast` flag.
+///
+/// Cursor's `GET /v0/models` catalog and jcode's static fallback list both
+/// return *composite* ids that fold effort/fast/thinking into the model
+/// string. The real `agent.v1.AgentService/Run` backend only recognizes the
+/// base id (see `~/.cursor/cli-config.json`'s `modelParameters`, which lists
+/// `grok-4.6`, `claude-opus-5`, `claude-sonnet-5`, ... as keys, each with
+/// separate `effort`/`fast`/`thinking`/`context` parameters). Sending the
+/// composite string as-is gets `ERROR_BAD_MODEL_NAME: Unknown model ID`.
+///
+/// This performs the same stripping the official CLI does before it talks to
+/// the wire protocol: drop a leading `cursor-` vendor prefix, drop a trailing
+/// `-fast` suffix (recording it as the `fast` flag), and drop a trailing
+/// effort/mode suffix (`-high`, `-xhigh`, `-medium`, `-low`, `-thinking`, or
+/// any combination such as `-thinking-high`). Ids that are already bare (no
+/// known suffix), including generic ones like `composer-2.5` or `gemini-
+/// 3.1-pro`, pass through unchanged.
+fn resolve_model_id(model: &str) -> (String, bool) {
+    let mut name = model.trim();
+
+    // Strip a `cursor-` vendor prefix (`cursor-grok-4.6-...` -> `grok-4.6-...`).
+    if let Some(stripped) = name.strip_prefix("cursor-") {
+        name = stripped;
+    }
+
+    // Strip a trailing `-fast` suffix; the `fast` param is sent separately.
+    let fast = if let Some(stripped) = name.strip_suffix("-fast") {
+        name = stripped;
+        true
+    } else {
+        false
+    };
+
+    // Strip trailing effort/mode suffixes, e.g. `-thinking-xhigh`, `-thinking`,
+    // `-high`, `-xhigh`, `-medium`, `-low`. These can stack (thinking + effort),
+    // so peel them off one segment at a time from the end.
+    const SUFFIXES: &[&str] = &["-xhigh", "-high", "-medium", "-low", "-thinking"];
+    loop {
+        let mut stripped_any = false;
+        for suffix in SUFFIXES {
+            if let Some(stripped) = name.strip_suffix(suffix) {
+                // Never strip past an empty or vendor-only remainder.
+                if stripped.is_empty() {
+                    break;
+                }
+                name = stripped;
+                stripped_any = true;
+                break;
+            }
+        }
+        if !stripped_any {
+            break;
+        }
+    }
+
+    (name.to_string(), fast)
+}
+
 /// Build the request frames for a single-shot prompt turn.
 ///
 /// Returns the ordered list of Connect frames that constitute the streamed
@@ -240,15 +301,17 @@ fn build_run_frames(prompt: &str, model: &str, cwd: &str) -> Vec<Vec<u8>> {
     inner.extend(field_varint(4, 1));
     let messages = field_ld(2, &field_ld(1, &field_ld(1, &inner)));
 
+    let (resolved_model, fast) = resolve_model_id(model);
+
     let mut req = field_str(1, "");
     req.extend(messages);
     req.extend(field_str(4, ""));
     req.extend(field_str(5, &conv));
-    req.extend(field_ld(9, &encode_model_meta(model, false)));
+    req.extend(field_ld(9, &encode_model_meta(&resolved_model, fast)));
     req.extend(field_varint(12, 0));
     // minimal catalog: a "default" entry plus the target model
     req.extend(field_ld(14, &field_str(1, "default")));
-    req.extend(field_ld(14, &encode_model_meta(model, false)));
+    req.extend(field_ld(14, &encode_model_meta(&resolved_model, fast)));
     req.extend(field_str(16, &conv));
     let frame0 = connect_frame(&field_ld(1, &req));
 
@@ -714,6 +777,90 @@ mod tests {
         let hay = String::from_utf8_lossy(frame0);
         assert!(hay.contains("PROMPT_MARKER"));
         assert!(hay.contains("composer-2.5"));
+    }
+
+    /// Live-verified against `agentn.global.api5.cursor.sh`: each of these
+    /// composite catalog ids previously failed with `ERROR_BAD_MODEL_NAME`
+    /// and the resolved base id on the right succeeded (2026-09-11).
+    #[test]
+    fn resolve_model_id_strips_vendor_prefix_and_fast_suffix() {
+        assert_eq!(
+            resolve_model_id("cursor-grok-4.6-high-fast"),
+            ("grok-4.6".to_string(), true)
+        );
+        assert_eq!(
+            resolve_model_id("cursor-grok-4.5-high"),
+            ("grok-4.5".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn resolve_model_id_strips_thinking_and_effort_suffixes() {
+        assert_eq!(
+            resolve_model_id("claude-opus-5-thinking-high"),
+            ("claude-opus-5".to_string(), false)
+        );
+        assert_eq!(
+            resolve_model_id("claude-opus-5-thinking-high-fast"),
+            ("claude-opus-5".to_string(), true)
+        );
+        assert_eq!(
+            resolve_model_id("claude-sonnet-5-thinking-xhigh"),
+            ("claude-sonnet-5".to_string(), false)
+        );
+        assert_eq!(
+            resolve_model_id("claude-fable-5-thinking-high"),
+            ("claude-fable-5".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn resolve_model_id_strips_plain_effort_suffix() {
+        assert_eq!(
+            resolve_model_id("gpt-5.4-high"),
+            ("gpt-5.4".to_string(), false)
+        );
+        assert_eq!(
+            resolve_model_id("gpt-5.4-medium"),
+            ("gpt-5.4".to_string(), false)
+        );
+        assert_eq!(
+            resolve_model_id("gpt-5.6-sol-high-fast"),
+            ("gpt-5.6-sol".to_string(), true)
+        );
+        assert_eq!(
+            resolve_model_id("gpt-5.6-sol-xhigh"),
+            ("gpt-5.6-sol".to_string(), false)
+        );
+        assert_eq!(
+            resolve_model_id("gemini-3.7-flash-high"),
+            ("gemini-3.7-flash".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn resolve_model_id_leaves_bare_ids_unchanged() {
+        // These are already bare base ids and must pass through untouched.
+        assert_eq!(
+            resolve_model_id("composer-2.5"),
+            ("composer-2.5".to_string(), false)
+        );
+        assert_eq!(
+            resolve_model_id("gemini-3.1-pro"),
+            ("gemini-3.1-pro".to_string(), false)
+        );
+        assert_eq!(
+            resolve_model_id("sonnet-4.6"),
+            ("sonnet-4.6".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn resolve_model_id_strips_fast_from_bare_composer() {
+        assert_eq!(
+            resolve_model_id("composer-2-fast"),
+            ("composer-2".to_string(), true)
+        );
     }
 
     #[test]
