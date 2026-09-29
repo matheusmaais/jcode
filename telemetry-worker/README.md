@@ -80,9 +80,9 @@ for explicit deletion requests.
 ### D1 size self-defense
 
 D1 hard-caps databases at 10 GB on Workers Paid (500 MB on Free). The first
-5 GB of account-wide paid storage is included. The worker therefore uses a
-4.5 GB soft limit, leaving room for other databases and for pruning to catch
-up before the 10 GB hard cap. At the old free-plan cap every insert failed and
+5 GB of account-wide paid storage is included, and storage beyond that is
+billed pay-as-you-go. The worker uses an 8 GB soft limit, leaving 2 GB of
+headroom for pruning to catch up before the 10 GB hard cap. At the old free-plan cap every insert failed and
 telemetry silently stopped (June 2026: ~3 days lost). Defenses, in order:
 
 - The worker observes `meta.size_after` on every D1 write. Past the soft
@@ -356,9 +356,34 @@ telemetry (`events.model_end` on `session_end` rows) and matches each one to a
 models.dev price, normalizing the gateway aliases users produce
 (`cc/claude-opus-5`, `openai/gpt-5.6-sol`, `claude-opus-4-5-20251101`,
 `...-4-8@Anthropic`, `-xhigh` effort suffixes). Re-run it after new models
-appear; it is an idempotent upsert. Current token coverage is ~97%, with the
-remainder being users' private gateway aliases (`my-coding`, `SeaaveyCombo`)
-that cannot be resolved to a public price.
+appear; it is an idempotent upsert. Coverage changes as models and gateway
+aliases change. Do not rely on a fixed historical coverage percentage.
+
+To investigate missing prices without modifying production, export the full
+unmatched-label list, ranked by volume, with the observed providers:
+
+```bash
+node scripts/sync-model-prices.mjs --dry-run --days=90 --report-json=unpriced.json
+```
+
+The report counts every model/provider pair, even when the same label occurs
+under several providers. Its denominator is **raw reported token counters**,
+which may contain overlapping cache counts, not normalized billable tokens or
+the percentage of dollar value covered. Empty usage reports unknown coverage.
+`--dry-run` performs remote reads and writes the requested local report only.
+Without `--dry-run`, the command still updates production prices as usual.
+
+There are two distinct fixes for unmatched labels:
+
+- Refresh prices for genuinely new public models. Verify gateway suffixes and
+  canonical model identities before adding mappings. Names such as `qwen3.8`
+  can refer to differently priced variants, so fuzzy matching is unsafe.
+- Private aliases such as `Coding` or `mux/fast` need authoritative route/model
+  metadata. A single alias can represent different models across installations.
+  Do not assign a global price from the label alone. To make future accounting
+  precise, capture the resolved provider/model and usage per request, including
+  cache semantics, service tier and context tier. Session-end model labels
+  cannot reconstruct model switches inside old sessions.
 
 Three things to know before quoting the number:
 

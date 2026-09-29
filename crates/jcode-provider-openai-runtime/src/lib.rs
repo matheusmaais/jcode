@@ -7,13 +7,17 @@
 //! Model-catalog/account-availability state stays in `jcode_base::provider`
 //! (it is shared vocabulary for routing), as does the pure request shaping in
 //! `jcode_base::provider::openai_request`.
+// Tests hold the std env/home serialization lock across awaits on purpose.
+#![cfg_attr(test, allow(clippy::await_holding_lock))]
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::{FutureExt, SinkExt, StreamExt as FuturesStreamExt};
 use jcode_base::auth::codex::CodexCredentials;
 use jcode_base::auth::oauth;
-use jcode_base::provider::openai_request::{build_responses_input, build_tools};
+use jcode_base::provider::openai_request::{
+    build_responses_input, build_tools, insert_additional_tools,
+};
 #[cfg(test)]
 use jcode_message_types::TOOL_OUTPUT_MISSING_TEXT;
 use jcode_message_types::{Message as ChatMessage, StreamEvent, ToolDefinition};
@@ -54,6 +58,26 @@ pub(crate) fn is_chatgpt_web_model(model: &str) -> bool {
 /// The Responses backend only exposes `image_generation` to general
 /// ChatGPT/GPT models. Codex models (ids containing `codex`) reject unknown
 /// hosted tools, so they must not receive it. See issue #369.
+/// Responses `additional_tools` / deferred tool loading requires gpt-5.4 or
+/// newer. Unknown model families stay eager, which is always correct.
+fn model_supports_additional_tools(model_id: &str) -> bool {
+    let lower = model_id.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("gpt-") else {
+        return false;
+    };
+    let version: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let mut parts = version.split('.').filter(|p| !p.is_empty());
+    let major: u32 = match parts.next().and_then(|p| p.parse().ok()) {
+        Some(major) => major,
+        None => return false,
+    };
+    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    major > 5 || (major == 5 && minor >= 4)
+}
+
 fn model_supports_image_generation(model_id: &str) -> bool {
     !model_id.to_ascii_lowercase().contains("codex")
 }
@@ -287,6 +311,10 @@ struct PersistentWsState {
     message_count: usize,
     /// Number of items we sent in the last full request (for detecting conversation changes)
     last_input_item_count: usize,
+    /// Fingerprints of the last canonical full input. A larger input can still
+    /// rewrite earlier items (for example, when tool outputs are reordered).
+    /// A count alone is not a safe continuation cursor in that case.
+    last_input_item_hashes: Vec<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -404,6 +432,13 @@ fn summarize_ws_input(items: &[Value]) -> WsInputStats {
         }
     }
     stats
+}
+
+fn persistent_ws_input_item_hashes(input: &[Value]) -> Vec<u64> {
+    input
+        .iter()
+        .map(jcode_provider_core::fingerprint::stable_hash_json)
+        .collect()
 }
 
 fn persistent_ws_incremental_items(input: &[Value], start_index: usize) -> (Vec<Value>, usize) {
@@ -726,16 +761,11 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
-    pub(crate) fn supports_extended_prompt_cache_retention(model_id: &str) -> bool {
-        jcode_base::provider::openai::supports_extended_prompt_cache_retention(model_id)
-    }
-
     fn effective_prompt_cache_retention<'a>(
         model_id: &str,
         configured: Option<&'a str>,
     ) -> Option<&'a str> {
-        configured
-            .or_else(|| Self::supports_extended_prompt_cache_retention(model_id).then_some("24h"))
+        jcode_base::provider::openai::effective_prompt_cache_retention(model_id, configured)
     }
 
     pub fn new(credentials: CodexCredentials) -> Self {
@@ -800,21 +830,17 @@ impl OpenAIProvider {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
-        let prompt_cache_retention = std::env::var("JCODE_OPENAI_PROMPT_CACHE_RETENTION")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        let prompt_cache_retention = match prompt_cache_retention.as_deref() {
-            Some("in_memory") | Some("24h") => prompt_cache_retention,
-            Some(other) => {
-                jcode_base::logging::info(&format!(
-                    "Warning: Unsupported JCODE_OPENAI_PROMPT_CACHE_RETENTION '{}'; expected 'in_memory' or '24h'",
-                    other
-                ));
-                None
-            }
-            None => None,
-        };
+        let prompt_cache_retention =
+            jcode_base::provider::openai::prompt_cache_retention_from_env();
+        if prompt_cache_retention.is_none()
+            && let Ok(raw) = std::env::var("JCODE_OPENAI_PROMPT_CACHE_RETENTION")
+            && !raw.trim().is_empty()
+        {
+            jcode_base::logging::warn(&format!(
+                "Unsupported JCODE_OPENAI_PROMPT_CACHE_RETENTION '{}'; expected 'in_memory' or '24h'",
+                raw.trim()
+            ));
+        }
         let max_output_tokens = Self::load_max_output_tokens();
         let reasoning_effort = jcode_base::config::config()
             .provider
@@ -1001,7 +1027,7 @@ impl OpenAIProvider {
             return None;
         }
         match value.as_str() {
-            // `swarm` is a UI sentinel meaning "max effort + use the swarm tool".
+            // `swarm` is a UI sentinel meaning "configured root effort + use the swarm tool".
             // We keep it stored so the UI/session reflect it and the agent injects
             // the swarm directive; it is translated to a real effort at request time
             // by `api_reasoning_effort`.
@@ -1056,24 +1082,40 @@ impl OpenAIProvider {
         }
     }
 
-    /// Translate a stored reasoning effort into the value sent to the API.
-    /// The `swarm` sentinel maps to the active model's strongest advertised
-    /// effort, falling back to `max` before catalog metadata is available.
+    /// Resolve swarm effort only at the wire boundary, preserving the stored mode.
     fn api_reasoning_effort(&self, effort: Option<&str>) -> Option<String> {
-        match effort {
-            Some(e) if jcode_base::prompt::is_swarm_effort(e) => {
-                let available = self.available_efforts();
-                jcode_provider_core::OPENAI_SELECTABLE_EFFORTS
-                    .iter()
-                    .rev()
-                    .find(|candidate| {
-                        !jcode_base::prompt::is_swarm_effort(candidate)
-                            && available.contains(candidate)
-                    })
-                    .map(|effort| (*effort).to_string())
-            }
-            other => other.map(|e| e.to_string()),
+        self.api_reasoning_effort_with_swarm_root(
+            effort,
+            effort.and_then(jcode_base::prompt::swarm_root_reasoning_effort),
+        )
+    }
+
+    fn api_reasoning_effort_with_swarm_root(
+        &self,
+        effort: Option<&str>,
+        swarm_root: Option<&str>,
+    ) -> Option<String> {
+        let effort = effort?;
+        if !jcode_base::prompt::is_swarm_effort(effort) {
+            return Some(effort.to_string());
         }
+        let resolved = swarm_root.unwrap_or("max");
+        let available = self.available_efforts();
+        let ladder = jcode_provider_core::OPENAI_SELECTABLE_EFFORTS;
+        let requested = ladder.iter().position(|e| *e == resolved)?;
+        // Preserve the old strongest-advertised mapping for max. For lower
+        // configured levels prefer the closest supported level at or below it,
+        // falling back to the minimum on models with a restricted ladder.
+        ladder[..=requested]
+            .iter()
+            .rev()
+            .find(|candidate| available.contains(candidate))
+            .or_else(|| {
+                ladder.iter().find(|candidate| {
+                    !jcode_base::prompt::is_swarm_effort(candidate) && available.contains(candidate)
+                })
+            })
+            .map(|effort| (*effort).to_string())
     }
 
     fn native_compaction_threshold_for_context_window(

@@ -34,6 +34,7 @@ fn with_clean_provider_test_env<T>(f: impl FnOnce() -> T) -> T {
         "OPENAI_COMPAT_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
         "JCODE_INITIAL_PROVIDER_EXPLICIT",
@@ -168,6 +169,7 @@ fn save_test_openrouter_model_cache(namespace: &str, source_api_base: &str, mode
                 context_length: None,
                 pricing: jcode_provider_openrouter::ModelPricing::default(),
                 created: None,
+                ..Default::default()
             })
             .collect(),
     };
@@ -208,7 +210,6 @@ fn test_multi_provider_with_openai() -> MultiProvider {
     save_test_openai_oauth_credentials();
     crate::env::set_var("OPENAI_API_KEY", "sk-test-openai-api-key");
     MultiProvider {
-        claude: RwLock::new(None),
         anthropic: RwLock::new(None),
         openai: RwLock::new(Some(test_openai_runtime() as Arc<dyn Provider>)),
         copilot_api: RwLock::new(None),
@@ -220,7 +221,6 @@ fn test_multi_provider_with_openai() -> MultiProvider {
         openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
         active_openai_compatible_profile: RwLock::new(None),
         active: RwLock::new(ActiveProvider::OpenAI),
-        use_claude_cli: false,
         startup_notices: RwLock::new(Vec::new()),
         initial_provider: None,
         routes_memo: std::sync::Mutex::new(None),
@@ -914,6 +914,7 @@ impl Provider for StubExternalRuntime {
                 api_method: self.api_method.to_string(),
                 available: true,
                 detail: String::new(),
+                usage: None,
                 cheapness: None,
             })
             .collect()
@@ -1010,7 +1011,6 @@ fn test_openrouter_runtime() -> anyhow::Result<Arc<dyn Provider>> {
 
 fn test_multi_provider_with_cursor() -> MultiProvider {
     MultiProvider {
-        claude: RwLock::new(None),
         anthropic: RwLock::new(None),
         openai: RwLock::new(None),
         copilot_api: RwLock::new(None),
@@ -1022,7 +1022,6 @@ fn test_multi_provider_with_cursor() -> MultiProvider {
         openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
         active_openai_compatible_profile: RwLock::new(None),
         active: RwLock::new(ActiveProvider::Cursor),
-        use_claude_cli: false,
         startup_notices: RwLock::new(Vec::new()),
         initial_provider: None,
         routes_memo: std::sync::Mutex::new(None),

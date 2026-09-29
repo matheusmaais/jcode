@@ -1,14 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-cd "$repo_root"
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 # `selfdev test` installs a shell-level `cargo` shim so raw `cargo test/check`
 # commands receive this wrapper's memory, linker, feature, and toolchain policy.
 # Exporting this recursion guard makes the final `cargo` invocation below bypass
 # that shim and resolve the real Cargo binary.
 export JCODE_IN_DEV_CARGO=1
+
+# Agent builds routinely saturate every core. At equal priority they starve
+# interactive UI threads (Jcode Desktop measured 100-260 ms input latency
+# during parallel test builds). Lower this build's priority once, inherited by
+# Cargo and every rustc child. Set JCODE_CARGO_NICE=0 to opt out.
+if [[ -z "${JCODE_CARGO_NICED:-}" ]]; then
+  export JCODE_CARGO_NICED=1
+  renice -n "${JCODE_CARGO_NICE:-10}" -p $$ >/dev/null 2>&1 || true
+fi
+
+# The exported BashTool shim survives `cd` and child shells. Do not redirect
+# Cargo back here when the caller has moved to a different checkout. Compare
+# physical paths so entering this checkout through a symlink still works.
+case "$(pwd -P)" in
+  "$repo_root"|"$repo_root"/*) cd "$repo_root" ;;
+  *) exec cargo "$@" ;;
+esac
 
 # shellcheck source=scripts/remote_config.sh
 source "$repo_root/scripts/remote_config.sh"

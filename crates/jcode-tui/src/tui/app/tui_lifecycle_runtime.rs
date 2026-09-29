@@ -67,10 +67,7 @@ impl App {
                 .as_deref()
                 .or(self.resume_session_id.as_deref())
                 .unwrap_or("connecting");
-            let _ = crossterm::execute!(
-                std::io::stdout(),
-                crossterm::terminal::SetTitle(format!("jcode SSH {host} {session}"))
-            );
+            self.set_terminal_title_base(session, format!("jcode SSH {host} {session}"));
             return;
         }
         let session_id = if self.is_remote {
@@ -126,10 +123,7 @@ impl App {
             Some(&fallback_label),
             is_canary,
         );
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::SetTitle(window_title)
-        );
+        self.set_terminal_title_base(session_id, window_title);
     }
 
     pub(super) fn reconnect_target_session_id(&self) -> Option<String> {
@@ -261,7 +255,10 @@ impl App {
             crate::logging::info(&format!("MCP: Found {} server(s) in config", server_count));
 
             let (successes, failures) = {
-                let manager = self.mcp_manager.write().await;
+                // `connect_all` uses the manager's internal locks. Keep only a
+                // read guard here so MCP management reads are not blocked by a
+                // slow initialize handshake.
+                let manager = self.mcp_manager.read().await;
                 let result = manager.connect_all().await.unwrap_or((0, Vec::new()));
                 // Cache server names with tool counts
                 let servers = manager.connected_servers().await;
